@@ -1,4 +1,10 @@
 {
+	"cli": {
+		"methods": [
+			"_pk",
+			"PK_errorsToText"
+		]
+	},
 	"tests": {
 		"methods": [
 			"test_prompt",

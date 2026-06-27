@@ -94,6 +94,22 @@ var $prompt:=$store.get("react-form")
 $prompt.metadata.model  // e.g. "GPT-4o" — preserved for inspection, not auto-applied
 ```
 
+### Command line (`pk`)
+
+A small [Fabric](https://github.com/danielmiessler/Fabric)-like CLI runs a prompt by name
+on input from a file, an argument, or a pipe, executing the [`pk`](Project/Sources/Methods/pk.4dm)
+method via `tool4d` and printing the result:
+
+```bash
+echo "long text…" | pk summarize
+pk translate -f notes.txt -v lang_code=fr-fr
+pk --list
+```
+
+Install it with a symlink (`./cli/pk --install`) and see [cli/README.md](cli/README.md) for
+the full reference. Prompts are resolved relative to your working directory
+(`./prompts` → `./Resources/prompts` → `~/.promptKit/prompts`).
+
 ### Find prepared prompt and strategy libraries
 
 If you want ready-to-use material, these repositories are good starting points:

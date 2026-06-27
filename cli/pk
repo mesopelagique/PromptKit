@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# pk — PromptKit CLI. A Fabric-like front end for running named prompts, but the
+# prompt is executed by a 4D method (pk) inside the PromptKit project, and the
+# result is emitted from 4D via LOG EVENT(Into system standard outputs; …).
+#
+#   echo "some text" | pk summarize          # input from a pipe
+#   pk summarize -f notes.txt                 # input from a file
+#   pk summarize -t "explicit text"           # input from an argument
+#   pk translate -v lang=French < notes.txt   # template variables
+#   pk --list                                 # list available prompts
+#   pk summarize --raw < notes.txt            # show the composed prompt, no API call
+#   pk --install                              # symlink this script into /usr/local/bin
+#
+# Prompt store resolution (done by the 4D side, relative to the *caller's* CWD):
+#   ./prompts  ->  ./Resources/prompts  ->  ~/.promptKit/prompts
+#
+# Runtime: tool4d by default. Override with PK_4D or TOOL4D (path to tool4d or a
+# full 4D binary). Provider/model/key come from AIKit (~/.openai for the key).
+
+set -euo pipefail
+
+PROG="pk"
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+# --- locate this script (following symlinks) and the PromptKit project ----------
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+PROJECT="$REPO_DIR/Project/PromptKit.4DProject"
+
+usage() {
+  cat <<'EOF'
+pk — PromptKit CLI. A Fabric-like front end for running named prompts. The prompt
+is executed by a 4D method (pk) inside the PromptKit project and the result is
+emitted from 4D via LOG EVENT(Into system standard outputs; …).
+
+Usage:
+  pk [options] <prompt-name>
+
+Input (first match wins): -t/--text, then -f/--file, then stdin (pipe).
+
+  echo "some text" | pk summarize           input from a pipe
+  pk summarize -f notes.txt                  input from a file
+  pk summarize -t "explicit text"            input from an argument
+  pk translate -v lang=French < notes.txt    template variables
+  pk --list                                  list available prompts
+  pk summarize --raw < notes.txt             show the composed prompt, no API call
+
+Options:
+  -l, --list             list available prompt names and exit
+  -f, --file FILE        read the input from FILE
+  -t, --text TEXT        use TEXT as the input
+  -m, --model MODEL      model to use (default: the runner's gpt-4o-mini)
+  -s, --strategy NAME    strategy name or literal strategy prompt
+  -c, --context TEXT     context name or literal context text
+      --session NAME      persistent session name (conversation history)
+      --provider NAME|URL AIKit provider name, or an OpenAI-compatible base URL
+      --store DIR         prompt store folder (overrides CWD lookup)
+  -v, --var key=value    template variable (repeatable)
+      --raw               render the composed prompt instead of calling the model
+  -o, --output FILE      also write the result to FILE
+      --verbose           show tool4d diagnostics on stderr
+      --install [DIR]     symlink this script into DIR (default /usr/local/bin)
+  -h, --help             show this help
+
+Prompt store resolution (relative to the caller's working directory):
+  ./prompts  ->  ./Resources/prompts  ->  ~/.promptKit/prompts
+
+Runtime: tool4d by default. Override with PK_4D or TOOL4D (path to a tool4d or
+full 4D binary); the override is used only when that file exists, otherwise tool4d
+is auto-discovered. Provider/model come from AIKit; the ~/.openai key file is used
+only for the default OpenAI provider.
+EOF
+  exit "${1:-0}"
+}
+
+# --- install: symlink into a bin directory --------------------------------------
+do_install() {
+  local target="${1:-/usr/local/bin}"
+  local link="$target/$PROG"
+  [ -d "$target" ] || die "directory does not exist: $target (try: pk --install \"\$HOME/bin\")"
+  if [ -w "$target" ]; then
+    ln -sf "$SCRIPT_DIR/pk" "$link"
+  else
+    echo "$PROG: $target is not writable, using sudo…" >&2
+    sudo ln -sf "$SCRIPT_DIR/pk" "$link"
+  fi
+  echo "Linked $link -> $SCRIPT_DIR/pk"
+  command -v "$PROG" >/dev/null 2>&1 || echo "Note: make sure $target is on your PATH."
+  exit 0
+}
+
+# --- find the 4D runtime --------------------------------------------------------
+find_tool4d() {
+  # Honour the PK_4D / TOOL4D override only when it points to an existing file.
+  local override
+  for override in "${PK_4D:-}" "${TOOL4D:-}"; do
+    if [ -n "$override" ] && [ -f "$override" ]; then echo "$override"; return; fi
+  done
+  local base candidate newest=""
+  for base in \
+    "$HOME/Library/Application Support/Code/User/globalStorage/4d.4d-analyzer/tool4d" \
+    "$HOME/Library/Application Support/Antigravity/User/globalStorage/4d.4d-analyzer/tool4d"; do
+    [ -d "$base" ] || continue
+    while IFS= read -r candidate; do
+      [ -x "$candidate" ] && newest="$candidate"
+    done < <(find "$base" -type f -path '*tool4d.app/Contents/MacOS/tool4d' 2>/dev/null | sort)
+  done
+  [ -n "$newest" ] && { echo "$newest"; return; }
+  return 1
+}
+
+# --- parse arguments ------------------------------------------------------------
+prompt=""
+input_file=""
+input_text=""
+have_text=0
+store=""
+model=""
+strategy=""
+context=""
+session=""
+provider=""
+output=""
+do_list=0
+do_raw=0
+verbose=0
+declare -a vars=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage 0 ;;
+    --install) shift; do_install "${1:-/usr/local/bin}" ;;
+    -l|--list) do_list=1; shift ;;
+    --raw) do_raw=1; shift ;;
+    -f|--file) input_file="${2:?--file needs a path}"; shift 2 ;;
+    -t|--text) input_text="${2-}"; have_text=1; shift 2 ;;
+    -m|--model) model="${2:?--model needs a value}"; shift 2 ;;
+    -s|--strategy) strategy="${2:?--strategy needs a value}"; shift 2 ;;
+    -c|--context) context="${2:?--context needs a value}"; shift 2 ;;
+    --session) session="${2:?--session needs a value}"; shift 2 ;;
+    --provider) provider="${2:?--provider needs a value}"; shift 2 ;;
+    --store) store="${2:?--store needs a path}"; shift 2 ;;
+    -o|--output) output="${2:?--output needs a path}"; shift 2 ;;
+    -v|--var) vars+=("${2:?--var needs key=value}"); shift 2 ;;
+    --verbose) verbose=1; shift ;;
+    --) shift; [ $# -gt 0 ] && prompt="$1"; break ;;
+    -*) die "unknown option: $1 (try: $PROG --help)" ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+
+[ -f "$PROJECT" ] || die "PromptKit project not found at $PROJECT"
+TOOL4D="$(find_tool4d)" || die "tool4d not found. Set PK_4D or TOOL4D to a tool4d/4D binary."
+[ -x "$TOOL4D" ] || die "4D runtime is not executable: $TOOL4D"
+
+[ "$do_list" -eq 1 ] || [ -n "$prompt" ] || die "no prompt name given (try: $PROG --list)"
+
+# --- resolve the input ----------------------------------------------------------
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/pk.XXXXXX")"
+cleanup() { rm -rf "$tmpdir"; }
+trap cleanup EXIT
+
+resolved_input_file=""
+if [ "$have_text" -eq 1 ]; then
+  resolved_input_file="$tmpdir/input.txt"
+  printf '%s' "$input_text" > "$resolved_input_file"
+elif [ -n "$input_file" ]; then
+  [ -f "$input_file" ] || die "input file not found: $input_file"
+  resolved_input_file="$(cd "$(dirname "$input_file")" && pwd)/$(basename "$input_file")"
+elif [ ! -t 0 ]; then
+  resolved_input_file="$tmpdir/input.txt"
+  cat > "$resolved_input_file"
+fi
+
+# --- build the JSON control payload (python3 keeps it correct & escaped) ---------
+nonce="PK-$(uuidgen 2>/dev/null || echo "$$-$RANDOM-$(date +%s)")"
+control_json="$tmpdir/control.json"
+
+PK_PROMPT="$prompt" \
+PK_INPUTFILE="$resolved_input_file" \
+PK_CWD="$(pwd -P)" \
+PK_STORE="$store" \
+PK_MODEL="$model" \
+PK_STRATEGY="$strategy" \
+PK_CONTEXT="$context" \
+PK_SESSION="$session" \
+PK_PROVIDER="$provider" \
+PK_LIST="$do_list" \
+PK_RAW="$do_raw" \
+PK_NONCE="$nonce" \
+python3 - "$control_json" "${vars[@]+"${vars[@]}"}" <<'PY'
+import json, os, sys
+
+ctrl = {
+    "prompt":    os.environ.get("PK_PROMPT", ""),
+    "inputFile": os.environ.get("PK_INPUTFILE", ""),
+    "cwd":       os.environ.get("PK_CWD", ""),
+    "nonce":     os.environ.get("PK_NONCE", ""),
+    "list":      os.environ.get("PK_LIST") == "1",
+    "raw":       os.environ.get("PK_RAW") == "1",
+}
+for key, env in (("store", "PK_STORE"), ("model", "PK_MODEL"),
+                 ("strategy", "PK_STRATEGY"), ("context", "PK_CONTEXT"),
+                 ("session", "PK_SESSION"), ("provider", "PK_PROVIDER")):
+    val = os.environ.get(env, "")
+    if val:
+        ctrl[key] = val
+
+variables = {}
+for pair in sys.argv[2:]:
+    k, sep, v = pair.partition("=")
+    if sep:
+        variables[k] = v
+if variables:
+    ctrl["variables"] = variables
+
+with open(sys.argv[1], "w") as fh:
+    json.dump(ctrl, fh)
+PY
+
+# --- run the 4D method ----------------------------------------------------------
+rawout="$tmpdir/out.txt"
+rawerr="$tmpdir/err.txt"
+"$TOOL4D" \
+  --project="$PROJECT" \
+  --startup-method="pk" \
+  --skip-onstartup \
+  --dataless \
+  --user-param="$control_json" \
+  >"$rawout" 2>"$rawerr" || true
+
+[ "$verbose" -eq 1 ] && [ -s "$rawerr" ] && cat "$rawerr" >&2
+
+# --- extract the framed payload -------------------------------------------------
+payload="$(awk -v n="$nonce" '
+  $0==n":OUT:BEGIN" {cap=1; next}
+  $0==n":OUT:END"   {cap=0; next}
+  cap               {print}
+' "$rawout")"
+
+code="$(awk -v n="$nonce" '
+  index($0, n":EXIT:")==1 {sub(n":EXIT:", "", $0); print}
+' "$rawout" | tail -1)"
+
+if [ -z "$code" ]; then
+  echo "$PROG: the 4D method did not complete (run with --verbose for details)" >&2
+  [ "$verbose" -ne 1 ] && [ -s "$rawerr" ] && tail -n 20 "$rawerr" >&2
+  exit 1
+fi
+
+if [ "$code" = "0" ]; then
+  printf '%s\n' "$payload"
+  [ -n "$output" ] && printf '%s\n' "$payload" > "$output"
+  exit 0
+else
+  printf '%s\n' "$payload" >&2
+  exit "$code"
+fi
