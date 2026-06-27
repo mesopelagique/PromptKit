@@ -43,6 +43,8 @@ emitted from 4D via LOG EVENT(Into system standard outputs; …).
 
 Usage:
   pk [options] <prompt-name>
+  pk config [--project] set provider=<name|url> model=<name>   set defaults
+  pk config [show|path|get <key>|unset <key>…]                 inspect/edit defaults
 
 Input (first match wins): -t/--text, then -f/--file, then stdin (pipe).
 
@@ -52,6 +54,10 @@ Input (first match wins): -t/--text, then -f/--file, then stdin (pipe).
   pk translate -v lang=French < notes.txt    template variables
   pk --list                                  list available prompts
   pk summarize --raw < notes.txt             show the composed prompt, no API call
+
+  # set a default provider+model once, then omit them:
+  pk config set provider=http://127.0.0.1:11434/v1 model=gemma4
+  echo "hello" | pk translate -v lang_code=fr-fr
 
 Options:
   -l, --list             list available prompt names and exit
@@ -72,6 +78,11 @@ Options:
 
 Prompt store resolution (relative to the caller's working directory):
   ./prompts  ->  ./Resources/prompts  ->  ~/.promptKit/prompts
+
+Defaults (so you can omit --provider/--model on every call):
+  precedence: CLI flag > env (PK_PROVIDER / PK_MODEL) > config file > built-in.
+  config file (first that exists): $PK_CONFIG, ./.pk.json, ~/.promptKit/config.json
+  honoured keys: provider, model, strategy, context, store.
 
 Runtime: tool4d by default. Override with PK_4D or TOOL4D (path to a tool4d or
 full 4D binary); the override is used only when that file exists, otherwise tool4d
@@ -117,6 +128,106 @@ find_tool4d() {
   return 1
 }
 
+# --- configuration: default provider/model/… ------------------------------------
+# A small JSON file of defaults, looked up (first that exists):
+#   $PK_CONFIG  ->  ./.pk.json (project-local)  ->  ~/.promptKit/config.json (user)
+# Honoured keys: provider, model, strategy, context, store.
+# Precedence at run time: CLI flag > env (PK_PROVIDER/PK_MODEL) > config file.
+USER_CONFIG="$HOME/.promptKit/config.json"
+config_file=""
+
+resolve_config_file() {
+  local c
+  for c in "${PK_CONFIG:-}" "$PWD/.pk.json" "$USER_CONFIG"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+cfg_value() { # <file> <key>  -> value on stdout (empty if missing)
+  python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+v=d.get(sys.argv[2],"")
+sys.stdout.write("" if v is None else str(v))' "$1" "$2"
+}
+
+config_default() { # <key>  -> value from the resolved config file (empty if none)
+  [ -n "$config_file" ] || return 0
+  cfg_value "$config_file" "$1"
+}
+
+do_config() { # pk config [--project|--user] [show|path|get|set|unset] [args…]
+  local target="$USER_CONFIG" action=""
+  local -a items=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) target="$PWD/.pk.json"; shift ;;
+      --user) target="$USER_CONFIG"; shift ;;
+      show|path|get|set|unset) action="$1"; shift ;;
+      *) items+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$action" ] || action="show"
+
+  case "$action" in
+    show)
+      local f
+      if f="$(resolve_config_file)"; then
+        echo "# $f"; cat "$f"; echo
+      else
+        echo "# no pk config found (looked for: \$PK_CONFIG, ./.pk.json, $USER_CONFIG)"
+        echo "# create one with:  pk config set provider=<name|url> model=<name>"
+      fi
+      ;;
+    path) resolve_config_file && echo || die "no pk config found" ;;
+    get)
+      [ "${#items[@]}" -ge 1 ] || die "usage: pk config get <key>"
+      local f; f="$(resolve_config_file)" || die "no pk config found"
+      cfg_value "$f" "${items[0]}"; echo
+      ;;
+    set)
+      [ "${#items[@]}" -ge 1 ] || die "usage: pk config set [--project] key=value…"
+      mkdir -p "$(dirname "$target")"
+      python3 - "$target" "${items[@]}" <<'PY'
+import json, sys
+target, pairs = sys.argv[1], sys.argv[2:]
+try:
+    with open(target) as fh: data = json.load(fh)
+    if not isinstance(data, dict): data = {}
+except Exception:
+    data = {}
+for pair in pairs:
+    k, sep, v = pair.partition("=")
+    if not sep: sys.exit("pk: config set expects key=value, got: %s" % pair)
+    data[k] = v
+with open(target, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True); fh.write("\n")
+PY
+      echo "Updated $target"
+      ;;
+    unset)
+      [ "${#items[@]}" -ge 1 ] || die "usage: pk config unset [--project] key…"
+      [ -f "$target" ] || die "no config file at $target"
+      python3 - "$target" "${items[@]}" <<'PY'
+import json, sys
+target, keys = sys.argv[1], sys.argv[2:]
+try:
+    with open(target) as fh: data = json.load(fh)
+    if not isinstance(data, dict): data = {}
+except Exception:
+    data = {}
+for k in keys: data.pop(k, None)
+with open(target, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True); fh.write("\n")
+PY
+      echo "Updated $target"
+      ;;
+    *) die "unknown config action: $action (use show|path|get|set|unset)" ;;
+  esac
+  exit 0
+}
+
 # --- parse arguments ------------------------------------------------------------
 prompt=""
 input_file=""
@@ -133,6 +244,9 @@ do_list=0
 do_raw=0
 verbose=0
 declare -a vars=()
+
+# subcommand: pk config …
+if [ "${1:-}" = "config" ]; then shift; do_config "$@"; fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -160,6 +274,15 @@ done
 [ -f "$PROJECT" ] || die "PromptKit project not found at $PROJECT"
 TOOL4D="$(find_tool4d)" || die "tool4d not found. Set PK_4D or TOOL4D to a tool4d/4D binary."
 [ -x "$TOOL4D" ] || die "4D runtime is not executable: $TOOL4D"
+
+# Apply defaults for anything not set on the command line:
+#   CLI flag (already set above) > env (PK_PROVIDER/PK_MODEL) > config file.
+config_file="$(resolve_config_file || true)"
+if [ -z "$provider" ]; then provider="${PK_PROVIDER:-$(config_default provider)}"; fi
+if [ -z "$model" ];    then model="${PK_MODEL:-$(config_default model)}";       fi
+if [ -z "$strategy" ]; then strategy="$(config_default strategy)";              fi
+if [ -z "$context" ];  then context="$(config_default context)";               fi
+if [ -z "$store" ];    then store="$(config_default store)";                   fi
 
 [ "$do_list" -eq 1 ] || [ -n "$prompt" ] || die "no prompt name given (try: $PROG --list)"
 

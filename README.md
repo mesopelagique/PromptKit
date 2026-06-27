@@ -104,11 +104,16 @@ method via `tool4d` and printing the result:
 echo "long text…" | pk summarize
 pk translate -f notes.txt -v lang_code=fr-fr
 pk --list
+
+# set a default provider+model once, then omit the flags:
+pk config set provider=http://127.0.0.1:11434/v1 model=gemma4
+echo "hello" | pk translate -v lang_code=fr-fr
 ```
 
 Install it with a symlink (`./cli/pk --install`) and see [cli/README.md](cli/README.md) for
 the full reference. Prompts are resolved relative to your working directory
-(`./prompts` → `./Resources/prompts` → `~/.promptKit/prompts`).
+(`./prompts` → `./Resources/prompts` → `~/.promptKit/prompts`); default provider/model come
+from `--provider`/`--model`, the `PK_PROVIDER`/`PK_MODEL` env, or a `pk config` file.
 
 ### Find prepared prompt and strategy libraries
 

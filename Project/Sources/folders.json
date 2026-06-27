@@ -1,7 +1,6 @@
 {
 	"cli": {
 		"methods": [
-			"_pk",
 			"PK_errorsToText"
 		]
 	},

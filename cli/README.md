@@ -107,6 +107,42 @@ pk summarize -f doc.txt --provider http://127.0.0.1:11434/v1 --model llama3   # 
 pk summarize -f doc.txt --provider Mistral                # a named AIKit provider
 ```
 
+## Defaults — stop repeating `--provider` / `--model`
+
+Set a default provider+model once and drop the flags from every call. The value is resolved
+with this precedence (first wins):
+
+1. the CLI flag (`--provider` / `--model` / `--strategy` / `--context` / `--store`)
+2. the environment (`PK_PROVIDER`, `PK_MODEL`)
+3. a **config file**
+4. the built-in default (OpenAI / `gpt-4o-mini`)
+
+The config file is the first that exists of: `$PK_CONFIG`, `./.pk.json` (project-local), then
+`~/.promptKit/config.json` (user). It is a flat JSON object; honoured keys are `provider`,
+`model`, `strategy`, `context`, `store`.
+
+```bash
+# one-time setup
+pk config set provider=http://127.0.0.1:11434/v1 model=gemma4
+
+# now the couple is implicit
+echo "hello" | pk translate -v lang_code=fr-fr
+```
+
+Manage it with the `config` subcommand:
+
+```bash
+pk config                       # show the resolved config file and its contents
+pk config path                  # print the resolved config file path
+pk config get provider          # print one value
+pk config set model=gpt-4o      # write to ~/.promptKit/config.json (user)
+pk config --project set model=gemma4   # write to ./.pk.json (this project only)
+pk config unset model           # remove a key
+```
+
+`./.pk.json` lets a project pin its own provider/model; the user file is the global fallback.
+A one-off `--provider`/`--model` (or `PK_PROVIDER`/`PK_MODEL`) still overrides the config.
+
 ## Options
 
 | Option | Description |

@@ -45,7 +45,7 @@ Recognised JSON keys:
 | `strategy` | Text | Strategy name or literal strategy prompt. |
 | `context` | Text | Context name or literal context text. |
 | `session` | Text | Session name (persistent conversation history). |
-| `provider` | Text | AIKit provider name, or an `http(s)://` base URL. |
+| `provider` | Text | AIKit provider name, or an `http(s)://` base URL. The CLI fills this from `--provider`, the `PK_PROVIDER` env, or a [`pk config`](../../cli/README.md#defaults--stop-repeating---provider----model) file. |
 | `variables` | Object | Template variables (`{{key}}` / `${input:key}`). |
 | `list` | Boolean | List available prompt names instead of running. |
 | `raw` | Boolean | Render the composed prompt instead of calling the model. |
