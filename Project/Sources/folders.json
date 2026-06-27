@@ -1,0 +1,10 @@
+{
+	"tests": {
+		"methods": [
+			"test_prompt",
+			"test_prompt_chain",
+			"TestOpenAI"
+		]
+	},
+	"trash": {}
+}
